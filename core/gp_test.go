@@ -81,3 +81,28 @@ func TestReplyErrDoesNotLeakBody(t *testing.T) {
 		t.Fatalf("lost server message: %v", err)
 	}
 }
+
+// A wrong address typed on the setup page must land back on the setup page with a readable
+// error, without ever switching to the browser-login ("login") page in between.
+func TestWrongEndpointReturnsToSetup(t *testing.T) {
+	d, _ := os.MkdirTemp("", "sidegate") // not t.TempDir: log.txt stays open, Windows can't delete it
+	dataDir, sessFile, confFile = d, d+"/session.bin", d+"/endpoint.txt"
+	cmds := make(chan string, 1)
+	go serveCommands(cmds)
+	<-events                               // initial "setup"
+	cmds <- "setup\t nonexistent。invalid " // full-width dot from a CJK input method must be normalized
+	for {
+		e := <-events
+		state, _, _ := strings.Cut(e, "\t")
+		if state == "checking" {
+			continue
+		}
+		if state != "setup" || !strings.HasPrefix(e, "setup\tnonexistent.invalid\t") ||
+			!strings.Contains(e, "找不到该服务器") || strings.Contains(e, "https://") {
+			t.Fatalf("got %q", e)
+		}
+		break
+	}
+	close(cmds)
+	<-events // exited
+}

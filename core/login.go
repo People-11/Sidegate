@@ -52,11 +52,7 @@ const cbKey = `Software\Classes\globalprotectcallback`
 // browserLogin runs SAML in the default browser. The callback URI handler is registered
 // under HKCU only for the duration of the login, pointing at "Sidegate.exe --callback",
 // which forwards the URL to us over loopback.
-func browserLogin(ctx context.Context, host string) (user, cookie string, err error) {
-	method, payload, err := prelogin(host)
-	if err != nil {
-		return "", "", err
-	}
+func browserLogin(ctx context.Context, method, payload string) (user, cookie string, err error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", "", err

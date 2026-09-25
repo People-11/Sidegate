@@ -34,10 +34,19 @@ func post(host, path string, form url.Values) ([]byte, error) {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err == nil && resp.StatusCode != 200 {
-		err = fmt.Errorf("%s: HTTP %d", path, resp.StatusCode)
+		err = &statusError{path, resp.StatusCode}
 	}
 	return body, err
 }
+
+type statusError struct {
+	path string
+	code int
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("%s: HTTP %d", e.path, e.code) }
+
+var errNotGP = errors.New("该地址不是 GlobalProtect 网关，或未启用 SAML 登录")
 
 func baseForm(host, computer string) url.Values {
 	return url.Values{
@@ -49,13 +58,17 @@ func baseForm(host, computer string) url.Values {
 // prelogin returns the SAML start page: either an HTML form (POST) or a URL (REDIRECT).
 func prelogin(host string) (method, payload string, err error) {
 	body, err := post(host, "/ssl-vpn/prelogin.esp?tmp=tmp&clientVer=4100&clientos=Windows&default-browser=1&cas-support=yes", url.Values{})
+	var se *statusError
+	if errors.As(err, &se) {
+		return "", "", errNotGP // a web server, but not a GlobalProtect gateway
+	}
 	if err != nil {
 		return "", "", err
 	}
 	doc := string(body)
 	req := xmlTag(doc, "saml-request")
 	if req == "" {
-		return "", "", fmt.Errorf("prelogin: no SAML request (status=%s %s)", xmlTag(doc, "status"), xmlTag(doc, "msg"))
+		return "", "", errNotGP // not GlobalProtect, or password login only
 	}
 	b, err := base64.StdEncoding.DecodeString(req)
 	return xmlTag(doc, "saml-auth-method"), string(b), err
