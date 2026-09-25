@@ -8,15 +8,18 @@ use eframe::egui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::f32::consts::TAU;
 use std::ffi::{CStr, CString, c_char};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     SetWindowSubclass, Shell_NotifyIconW,
@@ -25,7 +28,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const TITLE: &str = "Sidegate VPN";
 const W: f32 = 320.0;
-const H: f32 = 460.0;
+const H: f32 = 400.0;
+const MENU_W: f32 = 94.0; // tray right-click menu, same width as the in-app menu
+const MENU_H: f32 = 44.0;
 const ACCENT: Color32 = Color32::from_rgb(0xF4, 0x81, 0x20);
 const INK: Color32 = Color32::from_rgb(0x1F, 0x23, 0x28);
 const MUTED: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
@@ -75,6 +80,7 @@ struct Shared {
     hwnd: isize,
     icons: [isize; 2], // HICON: [off, on]
     on: AtomicBool,
+    menu: AtomicBool, // window is currently showing the tray right-click menu
     taskbar_created: u32,
 }
 
@@ -99,28 +105,88 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
-/// Show the popup just above the taskbar, bottom-right, and give it focus.
-fn show(hwnd: HWND) {
+/// Logical size -> physical pixels for this window's monitor.
+fn physical(hwnd: HWND, w: f32, h: f32) -> (i32, i32) {
+    let s = unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0;
+    ((w * s).round() as i32, (h * s).round() as i32)
+}
+
+/// Make the window layered at the given opacity. Re-applied before every fade: winit rewrites
+/// the ex-style and drops the layered bit.
+fn set_alpha(hwnd: HWND, alpha: u8) {
     unsafe {
-        let mut wa: RECT = std::mem::zeroed();
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0);
-        let mut r: RECT = std::mem::zeroed();
-        GetWindowRect(hwnd, &mut r);
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        SetWindowPos(
+        SetWindowLongPtrW(
             hwnd,
-            HWND_TOPMOST,
-            wa.right - w - 12,
-            wa.bottom - h - 12,
-            0,
-            0,
-            SWP_NOSIZE | SWP_SHOWWINDOW,
+            GWL_EXSTYLE,
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED as isize,
         );
-        SetForegroundWindow(hwnd);
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
     }
 }
 
+static FADE: AtomicU32 = AtomicU32::new(0);
+
+/// DWM doesn't animate this borderless popup, so fade it ourselves: in after showing, or out
+/// and then hide. Starting a new fade cancels one still running.
+fn fade(hwnd: HWND, show: bool) {
+    const TOTAL: f32 = 0.15; // seconds
+    let id = FADE.fetch_add(1, Ordering::Relaxed) + 1;
+    let h = hwnd as isize;
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        loop {
+            if FADE.load(Ordering::Relaxed) != id {
+                return;
+            }
+            let p = (t0.elapsed().as_secs_f32() / TOTAL).min(1.0);
+            let a = if show { p } else { 1.0 - p };
+            unsafe { SetLayeredWindowAttributes(h as HWND, 0, (a * 255.0).round() as u8, LWA_ALPHA) };
+            if p >= 1.0 {
+                break;
+            }
+            // One step per compositor frame, i.e. at the display's refresh rate.
+            if unsafe { DwmFlush() } < 0 {
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        }
+        if !show && FADE.load(Ordering::Relaxed) == id {
+            unsafe { ShowWindow(h as HWND, SW_HIDE) };
+        }
+    });
+}
+
+/// Place the window (its size given in logical px) with its bottom-right corner at (x, y),
+/// then fade it in and give it focus.
+fn place(hwnd: HWND, w: f32, h: f32, x: i32, y: i32) {
+    let (w, h) = physical(hwnd, w, h);
+    set_alpha(hwnd, 0);
+    unsafe {
+        SetWindowPos(hwnd, HWND_TOPMOST, x - w, y - h, w, h, SWP_NOACTIVATE);
+        ShowWindow(hwnd, SW_SHOW);
+        SetForegroundWindow(hwnd);
+    }
+    fade(hwnd, true);
+}
+
+/// Ask the running instance to show itself. Called from other processes (second launch, the
+/// browser's login callback): they aren't DPI-aware, so sizing the window from there would
+/// scale it wrongly; and they may hold the foreground right, which is passed on first.
+fn summon(hwnd: HWND) {
+    unsafe {
+        AllowSetForegroundWindow(ASFW_ANY);
+        PostMessageW(hwnd, WM_SHOW_REQ, 0, 0);
+    }
+}
+
+/// Show the popup just above the taskbar, bottom-right, and give it focus.
+fn show(hwnd: HWND) {
+    let mut wa: RECT = unsafe { std::mem::zeroed() };
+    unsafe { SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut _ as _, 0) };
+    place(hwnd, W, H, wa.right - 12, wa.bottom - 12);
+}
+
 const WM_TRAY: u32 = WM_APP + 1;
+const WM_SHOW_REQ: u32 = WM_APP + 2;
 
 /// Window-message hook on the egui window: tray icon clicks, Explorer restarts, and shutdown.
 /// On shutdown / log-off Windows allows a few seconds after WM_ENDSESSION, enough to tear down
@@ -129,6 +195,10 @@ unsafe extern "system" fn on_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _
     let s = shared();
     if msg == WM_ENDSESSION && wp != 0 {
         quit();
+    } else if msg == WM_SHOW_REQ {
+        s.menu.store(false, Ordering::Relaxed);
+        show(hwnd);
+        s.ctx.request_repaint();
     } else if msg == s.taskbar_created {
         tray(NIM_ADD); // Explorer restarted: our icon is gone, put it back
     } else if msg == WM_TRAY {
@@ -138,39 +208,23 @@ unsafe extern "system" fn on_msg(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _
                 if unsafe { IsWindowVisible(hwnd) } != 0 {
                     hide(hwnd);
                 } else if s.last_hide.lock().unwrap().elapsed() > Duration::from_millis(400) {
+                    s.menu.store(false, Ordering::Relaxed);
                     show(hwnd);
                     s.ctx.request_repaint();
                 }
             }
-            WM_RBUTTONUP => tray_menu(hwnd),
+            WM_RBUTTONUP => {
+                // App-styled menu: the same window, shrunk to menu size at the cursor.
+                let mut pt = unsafe { std::mem::zeroed() };
+                unsafe { GetCursorPos(&mut pt) };
+                s.menu.store(true, Ordering::Relaxed);
+                place(hwnd, MENU_W, MENU_H, pt.x, pt.y);
+                s.ctx.request_repaint();
+            }
             _ => {}
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
-}
-
-fn tray_menu(hwnd: HWND) {
-    unsafe {
-        let m = CreatePopupMenu();
-        AppendMenuW(m, MF_STRING, 1, wide("退出").as_ptr());
-        let mut pt = std::mem::zeroed();
-        GetCursorPos(&mut pt);
-        SetForegroundWindow(hwnd); // required so the menu closes when clicking elsewhere
-        let cmd = TrackPopupMenu(
-            m,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            pt.x,
-            pt.y,
-            0,
-            hwnd,
-            std::ptr::null(),
-        );
-        DestroyMenu(m);
-        PostMessageW(hwnd, WM_NULL, 0, 0);
-        if cmd == 1 {
-            quit();
-        }
-    }
 }
 
 /// Add / update / remove our notification-area icon.
@@ -196,7 +250,8 @@ fn tray(op: u32) {
 }
 
 fn hide(hwnd: HWND) {
-    unsafe { ShowWindow(hwnd, SW_HIDE) };
+    set_alpha(hwnd, 255);
+    fade(hwnd, false);
 }
 
 fn tray_icon(on: bool) -> isize {
@@ -292,8 +347,9 @@ fn style(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::light());
     ctx.all_styles_mut(|s| {
         s.visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-        // Same 1px border and no hover/focus expansion, so the text field's text never shifts.
-        s.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+        // egui text is grayscale-antialiased (no ClearType); the default linear coverage makes
+        // small CJK strokes thin and grey. A gamma below 1 renders them more solid.
+        s.visuals.text_options.color_transfer_function = egui::epaint::FontColorTransferFunction::Gamma(0.7);
         s.interaction.selectable_labels = false; // only the text field is selectable
         s.visuals.text_cursor.stroke = Stroke::new(2.0, ACCENT);
         for w in [
@@ -302,9 +358,10 @@ fn style(ctx: &egui::Context) {
             &mut s.visuals.widgets.active,
         ] {
             w.corner_radius = CornerRadius::same(8);
-            w.expansion = 0.0;
         }
-        s.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
+        // Menu items: grey fill on hover/press, no outline.
+        s.visuals.widgets.hovered.bg_stroke = Stroke::NONE;
+        s.visuals.widgets.active.bg_stroke = Stroke::NONE;
         s.visuals.menu_corner_radius = CornerRadius::same(10);
         s.visuals.popup_shadow = egui::Shadow {
             offset: [0, 3],
@@ -314,48 +371,130 @@ fn style(ctx: &egui::Context) {
         };
         s.visuals.window_stroke = Stroke::new(1.0, Color32::from_black_alpha(18));
         s.spacing.menu_margin = egui::Margin::same(6);
-        // Text field: inset (sunken) counterpart of the raised surfaces.
-        s.visuals.extreme_bg_color = CARD;
-        s.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_black_alpha(22));
-        s.spacing.button_padding = vec2(12.0, 6.0);
     });
 }
 
 // ---------- widgets ----------
 
-/// The switch's slightly-3D look, shared by every surface: soft layered drop shadow + fill + inner rim.
-fn raised(rect: egui::Rect, radius: f32, fill: Color32) -> Vec<egui::Shape> {
-    let mut v: Vec<egui::Shape> = [(1.0, 22u8), (2.5, 10), (5.0, 5)]
+// Lighting shared by raised surfaces: light comes from above, giving a soft blurred drop shadow,
+// a slight top-to-bottom gradient and a faint highlight along the flat top edge.
+
+/// Rounded-rect outline, clockwise from the top-left corner (for the gradient mesh).
+fn outline(rect: egui::Rect, r: f32) -> Vec<Pos2> {
+    let r = r.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let corners = [
+        (pos2(rect.left() + r, rect.top() + r), 180.0f32),
+        (pos2(rect.right() - r, rect.top() + r), 270.0),
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (pos2(rect.left() + r, rect.bottom() - r), 90.0),
+    ];
+    corners
         .iter()
-        .map(|&(g, a)| {
-            egui::Shape::rect_filled(
-                rect.translate(vec2(0.0, 1.5)).expand(g),
-                radius + g,
-                Color32::from_black_alpha(a),
+        .flat_map(|&(c, start)| (0..=8).map(move |i| c + Vec2::angled((start + i as f32 * 11.25).to_radians()) * r))
+        .collect()
+}
+
+/// Rounded rect filled with a vertical gradient (fan mesh; drawn inside an anti-aliased body).
+fn gradient_fill(rect: egui::Rect, r: f32, top: Color32, bottom: Color32) -> egui::Shape {
+    let pts = outline(rect, r);
+    let col = |y: f32| top.lerp_to_gamma(bottom, ((y - rect.top()) / rect.height()).clamp(0.0, 1.0));
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.center(), col(rect.center().y));
+    for p in &pts {
+        mesh.colored_vertex(*p, col(p.y));
+    }
+    let n = pts.len() as u32;
+    for i in 0..n {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % n);
+    }
+    egui::Shape::mesh(mesh)
+}
+
+/// Highlight along the flat top edge, fading out a little way into the corners.
+fn highlight(rect: egui::Rect, r: f32) -> Vec<egui::Shape> {
+    const SWEEP: f32 = 35.0; // degrees of each corner arc covered
+    let r = r.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let (tl, tr) = (
+        pos2(rect.left() + r, rect.top() + r),
+        pos2(rect.right() - r, rect.top() + r),
+    );
+    let at = |c: Pos2, deg: f32| c + Vec2::angled(deg.to_radians()) * r;
+    let mut pts: Vec<Pos2> = (0..=6)
+        .map(|i| at(tl, 270.0 - SWEEP + SWEEP * i as f32 / 6.0))
+        .collect();
+    pts.extend((0..=6).map(|i| at(tr, 270.0 + SWEEP * i as f32 / 6.0)));
+    // 6 arc segments, the straight top, 6 arc segments: fade over the outer 4 on each side.
+    let last = pts.len() - 2;
+    pts.windows(2)
+        .enumerate()
+        .map(|(i, p)| {
+            let k = ((i.min(last - i) as f32 + 0.5) / 4.0).min(1.0);
+            egui::Shape::line_segment(
+                [p[0], p[1]],
+                Stroke::new(1.0, Color32::from_white_alpha(64).gamma_multiply(k)),
             )
         })
-        .collect();
-    v.push(egui::Shape::rect_filled(rect, radius, fill));
-    v.push(egui::Shape::rect_stroke(
-        rect,
-        radius,
-        Stroke::new(1.0, Color32::from_black_alpha(18)),
-        egui::StrokeKind::Inside,
-    ));
+        .collect()
+}
+
+fn rim(rect: egui::Rect, r: f32, color: Color32) -> egui::Shape {
+    egui::Shape::rect_stroke(rect, r, Stroke::new(1.0, color), egui::StrokeKind::Inside)
+}
+
+/// egui's blurred shadow (smooth falloff, no colour banding).
+fn shadow(rect: egui::Rect, r: f32, blur: u8, dy: i8, color: Color32) -> egui::Shape {
+    egui::Shadow {
+        offset: [0, dy],
+        blur,
+        spread: 0,
+        color,
+    }
+    .as_shape(rect, r)
+    .into()
+}
+
+/// Bottom colour of a raised surface's gradient.
+fn shade(fill: Color32) -> Color32 {
+    fill.lerp_to_gamma(Color32::BLACK, 0.06)
+}
+
+/// Raised surface (switch knob, buttons, banner); `depth` scales the drop shadow.
+fn raised(rect: egui::Rect, r: f32, fill: Color32, depth: f32) -> Vec<egui::Shape> {
+    let bottom = shade(fill);
+    let mut v = vec![
+        shadow(
+            rect,
+            r,
+            (8.0 * depth) as u8,
+            (2.0 * depth) as i8,
+            Color32::from_black_alpha((40.0 * depth) as u8),
+        ),
+        shadow(rect, r, 2, 0, Color32::from_black_alpha(40)), // contact shadow: outline defined all round
+        egui::Shape::rect_filled(rect, r, bottom),            // anti-aliased edge; the mesh sits 1px inside
+        gradient_fill(rect.shrink(1.0), r - 1.0, fill, bottom),
+        rim(rect, r, Color32::from_black_alpha(30)),
+    ];
+    v.extend(highlight(rect.shrink(1.0), r - 1.0));
     v
 }
 
-/// Run `add` and paint a raised surface underneath whatever it laid out.
+/// Inset surface (switch track, text field, info card); also a raised surface while pressed.
+fn inset(rect: egui::Rect, r: f32, fill: Color32, rim_color: Color32) -> Vec<egui::Shape> {
+    vec![egui::Shape::rect_filled(rect, r, fill), rim(rect, r, rim_color)]
+}
+
+const INSET_RIM: Color32 = Color32::from_black_alpha(24);
+const PRESSED_RIM: Color32 = Color32::from_black_alpha(34);
+
+/// Run `add`, then paint `surface` (built from the laid-out rect) underneath it.
 fn under<R>(
     ui: &mut egui::Ui,
-    radius: f32,
-    fill: Color32,
+    surface: impl FnOnce(egui::Rect) -> Vec<egui::Shape>,
     add: impl FnOnce(&mut egui::Ui) -> egui::InnerResponse<R>,
 ) -> R {
     let slot = ui.painter().add(egui::Shape::Noop);
     let r = add(ui);
-    ui.painter()
-        .set(slot, egui::Shape::Vec(raised(r.response.rect, radius, fill)));
+    ui.painter().set(slot, egui::Shape::Vec(surface(r.response.rect)));
     r.inner
 }
 
@@ -367,94 +506,117 @@ fn big_toggle(ui: &mut egui::Ui, on: bool, busy: bool) -> egui::Response {
     let p = ctx.animate_bool_with_time(resp.id, on, 0.15);
     // Blend factor for the busy effects, so entering/leaving "connecting" never jumps.
     let b = ctx.animate_bool_with_time(resp.id.with("busy"), busy, 0.3);
-    let pulse = egui::lerp(0.5 + 0.5 * (now * 1.6).sin()..=0.5 + 0.5 * (now * 4.0).sin(), b);
+    let pulse = egui::lerp(0.5..=0.5 + 0.5 * (now * 4.0).sin(), b);
     let smooth = p * p * (3.0 - 2.0 * p);
     let painter = ui.painter();
     let r = rect.height() / 2.0;
 
-    // Halo: follows the switch position; breathes when on, pulses faster while busy.
-    for i in 1..=6 {
-        let grow = i as f32 * (2.5 + 1.5 * pulse);
-        let a = smooth * smooth * (0.09 - i as f32 * 0.013).max(0.0);
-        painter.rect_filled(rect.expand(grow), r + grow, ACCENT.gamma_multiply(a));
-    }
-
-    // Track colour follows the knob only (busy is shown by the halo), so it never flickers.
-    let track = TRACK_OFF.lerp_to_gamma(ACCENT, smooth);
-    painter.rect_filled(rect, r, track);
-    painter.rect_stroke(
+    // Halo: follows the switch position; steady when on, pulses while busy.
+    painter.add(shadow(
         rect,
         r,
-        Stroke::new(1.0, Color32::from_black_alpha(18)),
-        egui::StrokeKind::Inside,
-    );
+        18,
+        0,
+        ACCENT.gamma_multiply(smooth * smooth * (0.3 + 0.2 * pulse)),
+    ));
+    // Track colour follows the knob only (busy is shown by the halo), so it never flickers.
+    painter.extend(inset(rect, r, TRACK_OFF.lerp_to_gamma(ACCENT, smooth), INSET_RIM));
 
     let kr = r - 7.0;
     let c = pos2(
         egui::lerp((rect.left() + r)..=(rect.right() - r), smooth),
         rect.center().y,
     );
-    painter.extend(raised(
+    // Snap to whole physical pixels: the animated position is fractional and would blur the edge.
+    let knob = egui::emath::GuiRounding::round_to_pixels(
         egui::Rect::from_center_size(c, Vec2::splat(2.0 * kr)),
-        kr,
-        Color32::WHITE,
-    ));
+        ctx.pixels_per_point(),
+    );
+    painter.extend(raised(knob, kr, Color32::WHITE, 1.0));
 
-    if on || b > 0.0 {
-        ctx.request_repaint(); // halo animation, paced by vsync (only runs while visible)
+    // Continuous repaint only while busy (a steady connected state costs no CPU).
+    if b > 0.0 {
+        ctx.request_repaint();
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn menu_icon(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
-    let h = ui
-        .ctx()
-        .animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.12);
-    ui.painter()
-        .extend(raised(rect.shrink(1.0), 15.0, Color32::WHITE.lerp_to_gamma(CARD, h)));
-    for dy in [-6.0, 0.0, 6.0] {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+    let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let fill = Color32::WHITE.lerp_to_gamma(shade(Color32::WHITE), h);
+    ui.painter().extend(if resp.is_pointer_button_down_on() {
+        inset(rect.shrink(1.0), 12.0, shade(fill), PRESSED_RIM)
+    } else {
+        raised(rect.shrink(1.0), 12.0, fill, 0.5)
+    });
+    for dy in [-4.5, 0.0, 4.5] {
         let y = rect.center().y + dy;
         ui.painter().line_segment(
-            [pos2(rect.center().x - 8.0, y), pos2(rect.center().x + 8.0, y)],
-            Stroke::new(2.0, INK),
+            [pos2(rect.center().x - 6.0, y), pos2(rect.center().x + 6.0, y)],
+            Stroke::new(1.6, INK),
         );
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn logo(ui: &mut egui::Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let c = rect.center();
-    ui.painter()
-        .circle_stroke(c, size * 0.38, Stroke::new(size * 0.16, ACCENT));
-    ui.painter().circle_filled(c, size * 0.12, ACCENT);
+/// A menu entry: grey fill on hover/press, no frame otherwise.
+fn menu_item(ui: &mut egui::Ui, text: &str) -> bool {
+    ui.spacing_mut().button_padding = vec2(14.0, 7.0);
+    ui.add(egui::Button::new(text).frame_when_inactive(false)).clicked()
 }
 
-fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let slot = ui.painter().add(egui::Shape::Noop);
-    let b = egui::Button::new(RichText::new(text).font(bold(15.0)).color(Color32::WHITE)).frame(false);
-    let resp = ui
-        .add_sized([ui.available_width(), 42.0], b)
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    let fill = ACCENT.lerp_to_gamma(Color32::from_rgb(0xE0, 0x6F, 0x10), h);
-    ui.painter().set(slot, egui::Shape::Vec(raised(resp.rect, 10.0, fill)));
-    resp
+fn draw_logo(p: &egui::Painter, c: Pos2, size: f32) {
+    p.circle_stroke(c, size * 0.38, Stroke::new(size * 0.16, ACCENT));
+    p.circle_filled(c, size * 0.12, ACCENT);
 }
 
-fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let slot = ui.painter().add(egui::Shape::Noop);
-    let b = egui::Button::new(RichText::new(text).size(14.0).color(INK)).frame(false);
-    let resp = ui
-        .add_sized([ui.available_width(), 38.0], b)
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
+/// Full-width button: raised, darker on hover, pushed in while pressed.
+fn button(ui: &mut egui::Ui, text: &str, primary: bool) -> egui::Response {
+    let (fill, ink, font) = if primary {
+        (ACCENT, Color32::WHITE, bold(15.0))
+    } else {
+        (Color32::WHITE, INK, FontId::proportional(14.0))
+    };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
     let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    ui.painter().set(
-        slot,
-        egui::Shape::Vec(raised(resp.rect, 10.0, Color32::WHITE.lerp_to_gamma(CARD, h))),
-    );
-    resp
+    let fill = fill.lerp_to_gamma(shade(fill), h);
+    let down = resp.is_pointer_button_down_on();
+    let p = ui.painter();
+    p.extend(if down {
+        inset(rect, 10.0, shade(fill), PRESSED_RIM)
+    } else {
+        raised(rect, 10.0, fill, 1.0)
+    });
+    let c = rect.center() + vec2(0.0, if down { 1.0 } else { 0.0 });
+    p.text(c, egui::Align2::CENTER_CENTER, text, font, ink);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Shared top half of the setup and auth pages, so the two line up exactly.
+fn hero(ui: &mut egui::Ui, spin: bool, title: &str, sub: &str, sub_color: Color32) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+        let c = rect.center();
+        // Grey disc behind the logo; on the auth page the spinner runs round its rim.
+        ui.painter().circle_filled(c, 44.0, CARD);
+        ui.painter()
+            .circle_stroke(c, 44.0, Stroke::new(1.0, Color32::from_black_alpha(18)));
+        draw_logo(ui.painter(), c, 64.0);
+        if spin {
+            let now = ui.input(|i| i.time) as f32;
+            let pts: Vec<Pos2> = (0..=32)
+                .map(|i| c + Vec2::angled(now * 3.0 + i as f32 / 32.0 * TAU * 0.3) * 44.0)
+                .collect();
+            ui.painter().add(egui::Shape::line(pts, Stroke::new(3.0, ACCENT)));
+            ui.ctx().request_repaint();
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new(title).font(bold(20.0)).color(INK));
+        ui.add_space(4.0);
+        ui.label(RichText::new(sub).size(13.0).color(sub_color));
+    });
 }
 
 fn info_row(ui: &mut egui::Ui, k: &str, v: &str) {
@@ -467,12 +629,16 @@ fn info_row(ui: &mut egui::Ui, k: &str, v: &str) {
 }
 
 fn banner(ui: &mut egui::Ui, msg: &str) {
-    under(ui, 8.0, Color32::from_rgb(0xFD, 0xEE, 0xEE), |ui| {
-        egui::Frame::new().inner_margin(vec2(10.0, 8.0)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(msg).size(12.5).color(DANGER));
-        })
-    });
+    under(
+        ui,
+        |r| raised(r, 8.0, Color32::from_rgb(0xFD, 0xEE, 0xEE), 1.0),
+        |ui| {
+            egui::Frame::new().inner_margin(vec2(10.0, 8.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(msg).size(12.5).color(DANGER));
+            })
+        },
+    );
 }
 
 // ---------- app ----------
@@ -482,8 +648,11 @@ struct App {
     hwnd: HWND,
     was_focused: bool,
     input: String,
+    err_msg: String,   // last error shown on the setup page
+    err_input: String, // input text when that error arrived
     bottom_h: f32,
     warmed: bool,
+    menu_open: bool, // in-app dropdown menu
 }
 
 impl App {
@@ -513,6 +682,7 @@ impl App {
             hwnd: hwnd as isize,
             icons: [tray_icon(false), tray_icon(true)],
             on: AtomicBool::new(false),
+            menu: AtomicBool::new(false),
             taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         });
         unsafe { SetWindowSubclass(hwnd, Some(on_msg), 1, 0) };
@@ -549,108 +719,122 @@ impl App {
             hwnd,
             was_focused: false,
             input: String::new(),
+            err_msg: String::new(),
+            err_input: String::new(),
             bottom_h: 120.0,
             warmed: false,
+            menu_open: false,
         }
     }
 
-    fn header(&self, ui: &mut egui::Ui, st: &St) {
+    fn header(&mut self, ui: &mut egui::Ui, st: &St) {
         // Fixed-height row so logo, title and the 32px menu button share one centre line.
-        ui.allocate_ui_with_layout(
-            vec2(ui.available_width(), 32.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.set_height(32.0);
-                logo(ui, 22.0);
-                ui.label(RichText::new("Sidegate").font(bold(17.0)).color(INK));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let resp = menu_icon(ui);
-                    egui::Popup::menu(&resp).align(egui::RectAlign::BOTTOM_END).show(|ui| {
-                        ui.spacing_mut().button_padding = vec2(14.0, 7.0);
-                        if !st.user.is_empty() && ui.button("退出登录").clicked() {
-                            send("logout", "");
-                            ui.close();
-                        }
-                        if ui.button("退出程序").clicked() {
-                            quit();
-                        }
-                    });
-                });
-            },
-        );
+        let menu_btn = ui
+            .allocate_ui_with_layout(
+                vec2(ui.available_width(), 32.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_height(32.0);
+                    let (logo, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                    draw_logo(ui.painter(), logo.center(), 22.0);
+                    ui.label(RichText::new("Sidegate").font(bold(17.0)).color(INK));
+                    ui.with_layout(Layout::right_to_left(Align::Center), menu_icon).inner
+                },
+            )
+            .inner;
+        if menu_btn.clicked() {
+            self.menu_open = !self.menu_open;
+        }
+        // Our own dropdown rather than egui's Popup, which can fade in but closes instantly.
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(menu_btn.id.with("menu"), self.menu_open, 0.15);
+        if t == 0.0 {
+            return;
+        }
+        let area = egui::Area::new(menu_btn.id.with("menu_area"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(menu_btn.rect.right_bottom() + vec2(0.0, 4.0))
+            .fade_in(false)
+            .interactable(self.menu_open)
+            .show(ui.ctx(), |ui| {
+                ui.multiply_opacity(t);
+                egui::Frame::menu(ui.style())
+                    .show(ui, |ui| {
+                        ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                            if !st.user.is_empty() && menu_item(ui, "退出登录") {
+                                send("logout", "");
+                                self.menu_open = false;
+                            }
+                            if menu_item(ui, "退出程序") {
+                                quit();
+                            }
+                        })
+                    })
+                    .response
+                    .rect
+            });
+        // A click anywhere outside the menu (and its button) closes it.
+        let outside =
+            ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.inner.contains(p)));
+        if self.menu_open && outside && !menu_btn.contains_pointer() {
+            self.menu_open = false;
+        }
     }
 
-    fn setup_page(&mut self, ui: &mut egui::Ui, st: &St) {
+    /// `busy` = the address is being validated ("checking"): stay here until it's known good.
+    fn setup_page(&mut self, ui: &mut egui::Ui, st: &St, busy: bool) {
         if self.input.is_empty() {
             self.input = st.endpoint.clone();
         }
-        ui.add_space(36.0);
-        ui.vertical_centered(|ui| {
-            logo(ui, 64.0);
-            ui.add_space(14.0);
-            ui.label(RichText::new("连接到 GlobalProtect").font(bold(20.0)).color(INK));
-            ui.add_space(4.0);
-            ui.label(RichText::new("输入学校或公司提供的门户地址").size(13.0).color(MUTED));
+        // An error marks the field red and takes the hint line's place; it clears once the address is edited.
+        if st.msg != self.err_msg {
+            self.err_msg = st.msg.clone();
+            self.err_input = self.input.clone();
+        }
+        let error = !st.msg.is_empty() && self.input == self.err_input;
+        let (sub, sub_color) = if error {
+            (st.msg.as_str(), DANGER)
+        } else {
+            ("输入学校或公司提供的门户地址", MUTED)
+        };
+        hero(ui, false, "连接到 GlobalProtect", sub, sub_color);
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            let go = button(ui, if busy { "正在验证…" } else { "继续" }, true).clicked();
+            ui.add_space(12.0);
+            let slot = ui.painter().add(egui::Shape::Noop);
+            let te = ui.add(
+                egui::TextEdit::singleline(&mut self.input)
+                    .hint_text("vpn.example.edu")
+                    .font(FontId::proportional(15.0))
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 10)))
+                    .desired_width(f32::INFINITY),
+            );
+            let f = ui
+                .ctx()
+                .animate_bool_with_time(te.id.with("focus"), te.has_focus(), 0.15);
+            let e = ui.ctx().animate_bool_with_time(te.id.with("error"), error, 0.15);
+            let rim_color = INSET_RIM.lerp_to_gamma(ACCENT, f).lerp_to_gamma(DANGER, e);
+            ui.painter()
+                .set(slot, egui::Shape::Vec(inset(te.rect, 8.0, CARD, rim_color)));
+            let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (go || enter) && !busy {
+                send("setup", self.input.trim());
+            }
         });
-        ui.add_space(26.0);
-        let te = ui.add(
-            egui::TextEdit::singleline(&mut self.input)
-                .hint_text("vpn.example.edu")
-                .font(FontId::proportional(15.0))
-                .margin(vec2(12.0, 10.0))
-                .desired_width(f32::INFINITY),
-        );
-        let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        ui.add_space(12.0);
-        if primary_button(ui, "继续").clicked() || enter {
-            send("setup", self.input.trim());
-        }
-        if !st.msg.is_empty() {
-            ui.add_space(10.0);
-            banner(ui, &st.msg);
-        }
     }
 
     /// Shown until SSO completes: the browser has the login page, we just wait for its callback.
     fn auth_page(&mut self, ui: &mut egui::Ui, st: &St) {
-        let waiting_browser = st.state == "login";
-        ui.add_space(48.0);
-        ui.vertical_centered(|ui| {
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
-            let c = rect.center();
-            let now = ui.input(|i| i.time) as f32;
-            ui.painter().circle_filled(c, 44.0, CARD);
-            ui.painter()
-                .circle_stroke(c, 44.0, Stroke::new(1.0, Color32::from_black_alpha(18)));
-            ui.painter().circle_stroke(c, 18.0, Stroke::new(7.0, ACCENT));
-            ui.painter().circle_filled(c, 5.5, ACCENT);
-            let pts: Vec<Pos2> = (0..=32)
-                .map(|i| {
-                    let a = now * 3.0 + i as f32 / 32.0 * TAU * 0.3;
-                    c + vec2(a.cos(), a.sin()) * 44.0
-                })
-                .collect();
-            ui.painter().add(egui::Shape::line(pts, Stroke::new(3.0, ACCENT)));
-            ui.ctx().request_repaint();
-
-            ui.add_space(22.0);
-            let (title, sub) = if waiting_browser {
-                (
-                    "等待认证",
-                    "已在浏览器中打开登录页面
-完成登录后将自动连接",
-                )
-            } else {
-                ("正在连接", "正在建立安全连接…")
-            };
-            ui.label(RichText::new(title).font(bold(22.0)).color(INK));
-            ui.add_space(6.0);
-            ui.label(RichText::new(sub).size(13.0).color(MUTED));
-            ui.add_space(4.0);
-            ui.label(RichText::new(&st.endpoint).size(12.0).color(MUTED));
-        });
+        let (title, sub) = if st.state == "login" {
+            ("等待认证", "请在浏览器中完成登录")
+        } else {
+            ("正在连接", "正在建立安全连接…")
+        };
+        hero(ui, true, title, sub, MUTED);
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            if secondary_button(ui, "取消").clicked() {
+            if button(ui, "取消", false).clicked() {
                 send("disconnect", "");
             }
         });
@@ -658,7 +842,7 @@ impl App {
 
     fn main_page(&mut self, ui: &mut egui::Ui, st: &St) {
         let s = st.state.as_str();
-        let busy = matches!(s, "login" | "connecting");
+        let busy = matches!(s, "checking" | "login" | "connecting");
         let on = s != "off";
         ui.add_space(34.0);
         ui.vertical_centered(|ui| {
@@ -667,17 +851,17 @@ impl App {
             }
             ui.add_space(26.0);
             let (title, sub, col) = match s {
-                "on" => ("已连接", "流量正经由安全隧道传输".to_string(), ACCENT),
-                "connecting" => (
+                "on" => ("已连接", "流量正经由安全隧道传输", ACCENT),
+                _ if busy => (
                     "正在连接",
                     if st.msg.is_empty() {
-                        "请稍候…".into()
+                        "请稍候…"
                     } else {
-                        st.msg.clone()
+                        st.msg.as_str()
                     },
                     INK,
                 ),
-                _ => ("未连接", "点击开关以连接".into(), INK),
+                _ => ("未连接", "点击开关以连接", INK),
             };
             ui.label(RichText::new(title).font(bold(24.0)).color(col));
             ui.add_space(2.0);
@@ -691,19 +875,20 @@ impl App {
                 banner(ui, &st.msg);
                 ui.add_space(10.0);
             }
-            egui::Frame::new()
-                .fill(CARD)
-                .stroke(Stroke::new(1.0, Color32::from_black_alpha(22)))
-                .corner_radius(8)
-                .inner_margin(vec2(14.0, 10.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 6.0;
-                    info_row(ui, "账户", &st.user);
-                    info_row(ui, "网关", &st.endpoint);
-                    info_row(ui, "内网 IP", &st.ip);
-                    info_row(ui, "代理", "HTTP :10809 · SOCKS5 :10808");
-                });
+            under(
+                ui,
+                |r| inset(r, 8.0, CARD, INSET_RIM),
+                |ui| {
+                    egui::Frame::new().inner_margin(vec2(14.0, 10.0)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        info_row(ui, "账户", &st.user);
+                        info_row(ui, "网关", &st.endpoint);
+                        info_row(ui, "内网 IP", &st.ip);
+                        info_row(ui, "代理", "HTTP :10809 · SOCKS5 :10808");
+                    })
+                },
+            );
         });
         let h = r.response.rect.height();
         if (h - self.bottom_h).abs() > 0.5 {
@@ -711,34 +896,53 @@ impl App {
             ui.ctx().request_repaint();
         }
     }
+
+    /// The tray right-click menu: the same window, shrunk to menu size at the cursor.
+    fn tray_menu_page(&mut self, ui: &mut egui::Ui) {
+        let frame = egui::Frame::new().fill(Color32::WHITE).inner_margin(6);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                if menu_item(ui, "退出程序") {
+                    quit();
+                }
+            });
+        });
+    }
 }
 
 impl eframe::App for App {
     // Runs even while hidden: auto-hide on focus loss and keep the tray icon in sync.
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // Frame pacing: wait for the next compositor frame here (a kernel wait) instead of
+        // the GL driver's vsync, which busy-waits (~2.4 ms of CPU per frame on NVIDIA).
+        unsafe { DwmFlush() };
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
         if self.was_focused && !focused {
-            hide(self.hwnd);
+            hide(self.hwnd); // the menu flag stays set while it fades out; every show resets it
+            self.menu_open = false;
             *shared().last_hide.lock().unwrap() = Instant::now();
         }
         self.was_focused = focused;
 
-        let st = self.st.lock().unwrap().clone();
-        let on = st.state == "on";
+        let on = self.st.lock().unwrap().state == "on";
         if shared().on.swap(on, Ordering::Relaxed) != on {
             tray(NIM_MODIFY);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        if shared().menu.load(Ordering::Relaxed) {
+            return self.tray_menu_page(ui);
+        }
         if !self.warmed {
-            // Rasterize every status string's CJK glyphs up front, so the first state change
+            // Rasterize the status strings' CJK glyphs up front, so the first state change
             // after a click doesn't stall a frame on font-atlas work.
             self.warmed = true;
-            let text = "已连接未正在连接等待认证准备登录点击开关以流量经由安全隧道传输请稍候…在浏览器中完成已打开页面后将自动建立                        会话过期重新退出程序账户网关内网代理取消继续输入学校或公司提供的门户地址到";
+            let text = "已连接未正在验证等待认证点击开关以流量经由安全隧道传输请稍候…在浏览器中完成登录建立\
+                        会话过期重新退出程序账户网关内网代理取消继续输入学校或公司提供的门户地址到\
+                        找不该服务器检查是否确无法超时证书效网关或启用";
             for font in [
                 bold(24.0),
-                bold(22.0),
                 bold(20.0),
                 FontId::proportional(13.0),
                 FontId::proportional(12.5),
@@ -747,17 +951,26 @@ impl eframe::App for App {
             }
         }
         let st = self.st.lock().unwrap().clone();
-        let frame = egui::Frame::new().fill(Color32::WHITE).inner_margin(vec2(18.0, 14.0));
+        // Bottom margin equals the side margin, so the bottom button / info card sits as far
+        // from the bottom edge as from the sides.
+        let margin = egui::Margin {
+            left: 18,
+            right: 18,
+            top: 14,
+            bottom: 18,
+        };
+        let frame = egui::Frame::new().fill(Color32::WHITE).inner_margin(margin);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             self.header(ui, &st);
-            match st.state.as_str() {
-                "setup" => self.setup_page(ui, &st),
-                // First login has no account yet: stay on the auth page until the tunnel is up.
-                "login" => self.auth_page(ui, &st),
-                "connecting" if st.user.is_empty() => self.auth_page(ui, &st),
-                "starting" => {
+            // Without an account (first login), validation stays on the setup page and the
+            // rest of the login on the auth page, so the switch page only appears once connected.
+            match (st.state.as_str(), st.user.is_empty()) {
+                ("starting", _) => {
                     ui.centered_and_justified(|ui| ui.spinner());
                 }
+                ("setup", _) => self.setup_page(ui, &st, false),
+                ("checking", true) => self.setup_page(ui, &st, true),
+                ("login", _) | ("connecting", true) => self.auth_page(ui, &st),
                 _ => self.main_page(ui, &st),
             }
         });
@@ -774,7 +987,7 @@ fn main() -> eframe::Result {
                 GpCallback(c.as_ptr());
                 let h = FindWindowW(std::ptr::null(), wide(TITLE).as_ptr());
                 if !h.is_null() {
-                    show(h);
+                    summon(h);
                 }
             }
         }
@@ -786,7 +999,7 @@ fn main() -> eframe::Result {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let h = FindWindowW(std::ptr::null(), wide(TITLE).as_ptr());
             if !h.is_null() {
-                show(h);
+                summon(h);
             }
             return Ok(());
         }
@@ -800,6 +1013,10 @@ fn main() -> eframe::Result {
             .with_always_on_top()
             .with_taskbar(false)
             .with_visible(false), // we position it ourselves, then show
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false, // paced by DwmFlush in logic() instead
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(TITLE, opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))

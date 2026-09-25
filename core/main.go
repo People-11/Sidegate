@@ -3,10 +3,11 @@ package main
 // VPN core, linked into Sidegate.exe as a static library (see lib.go).
 // Driven by tab-separated lines:
 //   in:  "setup\t<endpoint>" | connect | disconnect | logout | quit
-//   out: "<state>\t<endpoint>\t<user>\t<ip>\t<msg>", state = setup|off|login|connecting|on|exited
+//   out: "<state>\t<endpoint>\t<user>\t<ip>\t<msg>", state = setup|off|checking|login|connecting|on|exited
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log"
 	"net"
@@ -52,11 +53,7 @@ func serveCommands(cmds <-chan string) {
 	if s := loadSession(b.ev.Endpoint); s != nil {
 		b.ev.User = s.User
 	}
-	if b.ev.Endpoint == "" {
-		b.emit("setup", "")
-	} else {
-		b.emit("off", "")
-	}
+	b.emit(idleState(b.ev.Endpoint), "")
 	for line := range cmds {
 		cmd, arg, _ := strings.Cut(line, "\t")
 		switch cmd {
@@ -66,7 +63,7 @@ func serveCommands(cmds <-chan string) {
 			b.connect()
 		case "disconnect":
 			b.disconnect()
-			b.emit("off", "")
+			b.emit(idleState(b.ev.Endpoint), "")
 		case "logout":
 			b.logout()
 		case "quit":
@@ -101,7 +98,8 @@ func (b *backend) emit(state, msg string) {
 }
 
 func (b *backend) setup(endpoint string) {
-	endpoint = strings.TrimSpace(endpoint)
+	// Full-width punctuation from a CJK input method ("vpn。example。edu").
+	endpoint = strings.NewReplacer("。", ".", "．", ".", "：", ":", "／", "/").Replace(strings.TrimSpace(endpoint))
 	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
 		endpoint = u.Host
 	}
@@ -138,11 +136,44 @@ func (b *backend) connect() {
 		if ctx.Err() == nil { // not a user-initiated disconnect
 			msg := ""
 			if err != nil {
-				msg = err.Error()
+				msg = friendly(err)
 			}
-			b.emit("off", msg)
+			b.emit(idleState(host), msg)
 		}
 	}()
+}
+
+// idleState is the page to show when not connected: with no session for the endpoint
+// (never logged in, logged out, or a wrong address was just tried) the endpoint page, so it
+// can be corrected; otherwise the switch page (an expired session just logs in again on connect).
+func idleState(host string) string {
+	if loadSession(host) == nil {
+		return "setup"
+	}
+	return "off"
+}
+
+// friendly turns common network failures into a short message for the UI. The address itself
+// is already on screen (input box / info card), so messages don't repeat it.
+func friendly(err error) string {
+	var dnsErr *net.DNSError
+	var certErr *tls.CertificateVerificationError
+	var netErr net.Error
+	var opErr *net.OpError
+	var urlErr *url.Error
+	switch {
+	case errors.As(err, &dnsErr):
+		return "找不到该服务器，请检查地址是否正确"
+	case errors.As(err, &certErr):
+		return "服务器证书无效"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "连接服务器超时"
+	case errors.As(err, &opErr) && opErr.Op == "dial":
+		return "无法连接到服务器"
+	case errors.As(err, &urlErr):
+		return urlErr.Err.Error() // drop the long request URL
+	}
+	return err.Error()
 }
 
 // disconnect tears down the tunnel but keeps the session cookie for next time.
@@ -162,7 +193,7 @@ func (b *backend) logout() {
 		post(s.Host, "/ssl-vpn/logout.esp", s.form()) // best effort: kill it server-side too
 	}
 	os.Remove(sessFile)
-	if logFile != nil { // log lines carry the username and tunnel IP
+	if logFile != nil { // logging out clears the log too
 		logFile.Truncate(0)
 		logFile.Seek(0, 0)
 	}
@@ -173,10 +204,10 @@ func (b *backend) logout() {
 }
 
 func (b *backend) run(ctx context.Context, host string) error {
-	b.emit("connecting", "")
 	s := loadSession(host)
 	var tc *TunnelConfig
 	if s != nil {
+		b.emit("connecting", "")
 		var err error
 		if tc, err = getConfig(s); err != nil {
 			log.Printf("saved session unusable: %v", err)
@@ -184,8 +215,15 @@ func (b *backend) run(ctx context.Context, host string) error {
 		}
 	}
 	if s == nil {
+		// "checking" keeps the setup page up while the address is validated, so a wrong
+		// address never flashes the browser-login page.
+		b.emit("checking", "")
+		method, payload, err := prelogin(host)
+		if err != nil {
+			return err
+		}
 		b.emit("login", "请在浏览器中完成登录")
-		user, cookie, err := browserLogin(ctx, host)
+		user, cookie, err := browserLogin(ctx, method, payload)
 		if err != nil {
 			return err
 		}
@@ -270,8 +308,7 @@ func (b *backend) runTunnel(ctx context.Context, s *Session, tc *TunnelConfig, v
 	}()
 	for ctx.Err() == nil {
 		c, err := openTunnel(s, tc.TunnelURL)
-		if errors.Is(err, errAuth) {
-			os.Remove(sessFile)
+		if errors.Is(err, errAuth) { // session.bin is kept: the next connect re-logs in and overwrites it
 			return errors.New("会话已过期，请重新连接以登录")
 		}
 		if err != nil {

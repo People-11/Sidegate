@@ -12,7 +12,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 )
 
-// Two stacks wired back to back stand in for "us <-> tunnel <-> campus network".
+// Two stacks wired back to back stand in for "us <-> tunnel <-> the VPN network".
 func TestStackTCPAndDNS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
